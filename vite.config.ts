@@ -14,7 +14,7 @@ export default defineConfig(() => {
         configureServer(server) {
           server.middlewares.use((req, res, next) => {
             if (req.url && (req.url.startsWith('/pac/') || req.url.startsWith('/api/'))) {
-              return app(req, res, next);
+              return (app as any)(req, res, next);
             }
             next();
           });
