@@ -9,7 +9,7 @@ export const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 const app = express();
 
-// Parse JSON and form data
+app.set('trust proxy', true);
 app.use(express.json());
 
 // Enable CORS for web clients and tools
@@ -22,6 +22,32 @@ app.use((req, res, next) => {
   }
   next();
 });
+
+// Helper function to extract client IP address reliably on Vercel / proxies
+function getCallerIp(req) {
+  const xForwardedFor = req.headers['x-forwarded-for'];
+  if (xForwardedFor) {
+    const raw = Array.isArray(xForwardedFor) ? xForwardedFor[0] : xForwardedFor;
+    const firstIp = raw.split(',')[0].trim();
+    if (firstIp) return firstIp.replace(/^::ffff:/, '');
+  }
+
+  const xVercelForwardedFor = req.headers['x-vercel-forwarded-for'];
+  if (xVercelForwardedFor) {
+    const raw = Array.isArray(xVercelForwardedFor) ? xVercelForwardedFor[0] : xVercelForwardedFor;
+    const firstIp = raw.split(',')[0].trim();
+    if (firstIp) return firstIp.replace(/^::ffff:/, '');
+  }
+
+  const xRealIp = req.headers['x-real-ip'];
+  if (xRealIp) {
+    const raw = Array.isArray(xRealIp) ? xRealIp[0] : xRealIp;
+    if (raw.trim()) return raw.trim().replace(/^::ffff:/, '');
+  }
+
+  const remoteAddr = req.ip || req.socket?.remoteAddress || '';
+  return String(remoteAddr).replace(/^::ffff:/, '').trim() || 'unknown';
+}
 
 // Helper function to return fallback DIRECT PAC script
 function getDirectPac() {
@@ -40,73 +66,104 @@ function getShamCashPac(proxyHost, proxyPort) {
 `;
 }
 
-// Main PAC Route: /pac/:username (also available as /api/pac/:username)
+// Main PAC Route: /pac/:username (with IP Binding protection)
 async function handlePacRequest(req, res) {
   const { username } = req.params;
 
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+
   if (!username || username.trim() === '') {
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     return res.send(getDirectPac());
   }
 
   try {
     const trimmedUsername = username.trim();
+    const callerIp = getCallerIp(req);
 
-    // Query Supabase proxy_clients table
+    // 1. Find user in Supabase proxy_clients table
     const { data, error } = await supabase
       .from('proxy_clients')
-      .select('id, username, is_active, expiry_date, proxy_host, proxy_port')
+      .select('*')
       .eq('username', trimmedUsername)
       .maybeSingle();
 
     if (error) {
       console.error(`[PAC] Supabase query error for ${trimmedUsername}:`, error.message);
-      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
       return res.send(getDirectPac());
     }
 
     if (!data) {
       console.warn(`[PAC] Client not found: ${trimmedUsername}`);
-      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
       return res.send(getDirectPac());
     }
 
-    // Check is_active
+    // 2. Verify client is active and expiry_date >= today
     const isActive = data.is_active === true || data.is_active === 'true';
 
-    // Check expiry_date >= today
     let isNotExpired = false;
     if (data.expiry_date) {
-      // Normalize today to start of day (midnight) in UTC/local
       const today = new Date();
       today.setHours(0, 0, 0, 0);
 
       const clientExpiry = new Date(data.expiry_date);
-      // Set expiry to end of that day (23:59:59.999) if only date provided
-      if (!data.expiry_date.includes('T')) {
+      if (!String(data.expiry_date).includes('T')) {
         clientExpiry.setHours(23, 59, 59, 999);
       }
 
       isNotExpired = clientExpiry >= today;
     }
 
-    // Check proxy host and port
     const hasProxy = Boolean(data.proxy_host && data.proxy_port);
 
-    if (isActive && isNotExpired && hasProxy) {
-      console.log(`[PAC] Active proxy served for ${trimmedUsername} -> ${data.proxy_host}:${data.proxy_port}`);
-      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    if (!isActive || !isNotExpired || !hasProxy) {
+      console.log(
+        `[PAC] Inactive or expired client ${trimmedUsername}: active=${isActive}, validDate=${isNotExpired}`
+      );
+      return res.send(getDirectPac());
+    }
+
+    // 3. IP Binding Verification
+    const registeredIp = data.registered_ip ? String(data.registered_ip).trim() : null;
+
+    if (!registeredIp) {
+      // First device requesting the PAC URL: bind callerIp in registered_ip
+      if (callerIp && callerIp !== 'unknown') {
+        const { error: updateError } = await supabase
+          .from('proxy_clients')
+          .update({
+            registered_ip: callerIp,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', data.id);
+
+        if (updateError) {
+          console.error(
+            `[PAC] Failed to bind IP ${callerIp} for ${trimmedUsername}:`,
+            updateError.message
+          );
+        } else {
+          console.log(`[PAC] Bound first device IP ${callerIp} for user ${trimmedUsername}`);
+        }
+      }
+
+      return res.send(getShamCashPac(data.proxy_host, data.proxy_port));
+    }
+
+    // registered_ip is NOT null: compare callerIp with registeredIp
+    if (callerIp === registeredIp) {
+      console.log(
+        `[PAC] IP match (${callerIp}) for ${trimmedUsername} -> serving PROXY ${data.proxy_host}:${data.proxy_port}`
+      );
       return res.send(getShamCashPac(data.proxy_host, data.proxy_port));
     } else {
-      console.log(`[PAC] Inactive/expired client ${trimmedUsername}: active=${isActive}, validDate=${isNotExpired}, hasProxy=${hasProxy}`);
-      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      console.warn(
+        `[PAC] IP mismatch for ${trimmedUsername}: caller=${callerIp}, registered=${registeredIp} -> blocking (DIRECT)`
+      );
       return res.send(getDirectPac());
     }
   } catch (err) {
     console.error(`[PAC] Unexpected error for ${username}:`, err);
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     return res.send(getDirectPac());
   }
 }
@@ -115,13 +172,14 @@ async function handlePacRequest(req, res) {
 app.get('/pac/:username', handlePacRequest);
 app.get('/api/pac/:username', handlePacRequest);
 
-// Status API for testing and frontend diagnostics
+// Status API for diagnostics
 app.get('/api/client-status/:username', async (req, res) => {
   const { username } = req.params;
+  const callerIp = getCallerIp(req);
   try {
     const { data, error } = await supabase
       .from('proxy_clients')
-      .select('id, username, is_active, expiry_date, proxy_host, proxy_port')
+      .select('*')
       .eq('username', username.trim())
       .maybeSingle();
 
@@ -133,20 +191,24 @@ app.get('/api/client-status/:username', async (req, res) => {
       return res.status(404).json({
         found: false,
         username,
+        caller_ip: callerIp,
         status: 'not_found',
-        pac_mode: 'DIRECT'
+        pac_mode: 'DIRECT',
       });
     }
 
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const clientExpiry = new Date(data.expiry_date);
-    if (!data.expiry_date?.includes?.('T')) {
+    if (!String(data.expiry_date || '').includes('T')) {
       clientExpiry.setHours(23, 59, 59, 999);
     }
     const isNotExpired = clientExpiry >= today;
     const isActive = data.is_active === true;
-    const isEligible = isActive && isNotExpired && Boolean(data.proxy_host && data.proxy_port);
+    const registeredIp = data.registered_ip ? String(data.registered_ip).trim() : null;
+    const ipAllowed = !registeredIp || registeredIp === callerIp;
+    const isEligible =
+      isActive && isNotExpired && Boolean(data.proxy_host && data.proxy_port) && ipAllowed;
 
     return res.json({
       found: true,
@@ -154,10 +216,13 @@ app.get('/api/client-status/:username', async (req, res) => {
       is_active: data.is_active,
       expiry_date: data.expiry_date,
       is_expired: !isNotExpired,
+      registered_ip: registeredIp,
+      caller_ip: callerIp,
+      ip_match: ipAllowed,
       is_eligible: isEligible,
       proxy_host: data.proxy_host,
       proxy_port: data.proxy_port,
-      pac_mode: isEligible ? `PROXY ${data.proxy_host}:${data.proxy_port}` : 'DIRECT'
+      pac_mode: isEligible ? `PROXY ${data.proxy_host}:${data.proxy_port}` : 'DIRECT',
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -169,9 +234,10 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     service: 'shamcash-proxy-api',
-    timestamp: new Date().toISOString()
+    ip_binding: 'enabled',
+    caller_ip: getCallerIp(req),
+    timestamp: new Date().toISOString(),
   });
 });
 
-// Export default app for Vercel Serverless Function (@vercel/node)
 export default app;
