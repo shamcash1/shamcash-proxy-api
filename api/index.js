@@ -24,7 +24,7 @@ app.use((req, res, next) => {
   );
   res.header(
     'Access-Control-Expose-Headers',
-    'profile-title, profile-update-interval, subscription-userinfo, subscription-always-hwid-enable, content-disposition'
+    'profile-title, profile-update-interval, subscription-userinfo, subscription-always-hwid-enable, routing, content-disposition'
   );
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
@@ -213,13 +213,73 @@ async function handleSubscriptionRequest(req, res) {
     }
     const expireUnix = Math.floor(expiryDateObj.getTime() / 1000);
 
-    // 3. Set Official Happ App Management & Subscription Headers
+    // 3. Set Official Happ App Management, Routing & Subscription Headers
     const profileTitlePlain = `VPN Alishop - ${clientData.username}`.slice(0, 25);
     const profileTitleBase64 = Buffer.from(profileTitlePlain, 'utf-8').toString('base64');
+
+    // Happ Routing Profile:
+    // - Routes DNS servers (8.8.8.8 / 1.1.1.1) DIRECT so UDP port 53 never hangs on TCP-only SOCKS5 proxies
+    // - Sets DomainStrategy to "AsIs" so Xray sends the sniffed domain name (ATYP=3) to AstroProxy instead of raw IP
+    const happRoutingProfile = {
+      Name: 'ShamCash Fix',
+      GlobalProxy: 'true',
+      RouteOrder: 'block-proxy-direct',
+      RemoteDNSType: 'DoU',
+      RemoteDNSDomain: '',
+      RemoteDNSIP: '8.8.8.8',
+      DomesticDNSType: 'DoU',
+      DomesticDNSDomain: '',
+      DomesticDNSIP: '8.8.8.8',
+      Geoipurl: '',
+      Geositeurl: '',
+      LastUpdated: '1762716000',
+      DnsHosts: {
+        'shamcash.sy': '191.44.71.71',
+        'api.shamcash.sy': '191.44.71.71',
+        'bank.shamcash.sy': '191.44.71.71',
+        'cloudflare-dns.com': '1.1.1.1',
+        'dns.google': '8.8.8.8',
+      },
+      DirectSites: [],
+      DirectIp: [
+        '8.8.8.8',
+        '8.8.4.4',
+        '1.1.1.1',
+        '1.0.0.1',
+        '10.0.0.0/8',
+        '172.16.0.0/12',
+        '192.168.0.0/16',
+        '169.254.0.0/16',
+        '224.0.0.0/4',
+        '255.255.255.255',
+      ],
+      ProxySites: [
+        'shamcash.sy',
+        'shamcash.org',
+        'shamcash.com',
+        'shamcash.net',
+        'shamcashsy.net',
+        'shamcash-api.com',
+      ],
+      ProxyIp: [],
+      BlockSites: [],
+      BlockIp: [],
+      DomainStrategy: 'AsIs',
+      FakeDNS: 'false',
+      UseChunkFiles: 'false',
+    };
+
+    const routingBase64 = Buffer.from(JSON.stringify(happRoutingProfile), 'utf-8')
+      .toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/g, '');
+    const happRoutingLink = `happ://routing/onadd/${routingBase64}`;
 
     res.setHeader('profile-title', `base64:${profileTitleBase64}`);
     res.setHeader('profile-update-interval', '1');
     res.setHeader('subscription-always-hwid-enable', '1');
+    res.setHeader('routing', happRoutingLink);
     res.setHeader('per-app-proxy-mode', 'on');
     res.setHeader('per-app-proxy-list-set', 'com.shmacash.shamcash');
     res.setHeader(
@@ -242,14 +302,7 @@ async function handleSubscriptionRequest(req, res) {
       } else {
         happSocksUri = `socks://${host}:${port}#${tag}`;
       }
-      const bodyLines = [
-        `#profile-title: base64:${profileTitleBase64}`,
-        '#profile-update-interval: 1',
-        '#per-app-proxy-mode: on',
-        '#per-app-proxy-list-set: com.shmacash.shamcash',
-        happSocksUri,
-      ].join('\n');
-      return res.status(200).send(`${bodyLines}\n`);
+      return res.status(200).send(`${happSocksUri}\n`);
     }
 
     // 5. Standard v2rayNG / V2Box Base64 format
