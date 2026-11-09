@@ -1,6 +1,6 @@
 -- ============================================================
--- Sham Cash Proxy System - Supabase SQL Schema & IP Binding
--- كود إنشاء وتحديث جدول proxy_clients مع ميزة ربط الجهاز (IP Binding)
+-- Sham Cash Proxy System - Supabase SQL Schema, Auth & IP Binding
+-- كود إنشاء وتحديث جدول proxy_clients لدعم مصادقة البروكسي وربط الجهاز
 -- ============================================================
 
 -- 1. إنشاء جدول proxy_clients (إذا لم يكن موجوداً)
@@ -11,13 +11,17 @@ CREATE TABLE IF NOT EXISTS public.proxy_clients (
     expiry_date DATE NOT NULL,
     proxy_host TEXT NOT NULL,
     proxy_port INTEGER NOT NULL,
+    proxy_username TEXT DEFAULT NULL,
+    proxy_password TEXT DEFAULT NULL,
     registered_ip TEXT DEFAULT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
 
--- 2. إضافة عمود registered_ip للجدول الحالي (لحماية الرابط عبر IP Binding)
+-- 2. إضافة أعمدة مصادقة البروكسي وعمود الـ IP المسجل للجدول الحالي
 ALTER TABLE public.proxy_clients
+ADD COLUMN IF NOT EXISTS proxy_username TEXT DEFAULT NULL,
+ADD COLUMN IF NOT EXISTS proxy_password TEXT DEFAULT NULL,
 ADD COLUMN IF NOT EXISTS registered_ip TEXT DEFAULT NULL;
 
 -- 3. إنشاء مؤشر فهرسة للبحث السريع بواسطة اسم المستخدم (username)

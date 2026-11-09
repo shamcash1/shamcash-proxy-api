@@ -111,29 +111,6 @@ async function verifyAndBindClient(username, callerIp) {
   return { allowed: false, reason: 'ip_mismatch', client: data };
 }
 
-// Helper function to build Base64 Subscription URI for v2rayNG / V2Box
-function buildSubscriptionBase64(client, protocol = 'socks') {
-  // 1. استخراج بيانات البروكسي:
-  const host = String(client.proxy_host).trim();
-  const port = Number(client.proxy_port);
-  const user = client.proxy_user || client.proxy_username;
-  const pass = client.proxy_pass || client.proxy_password;
-
-  const credentials = user && pass ? `${user}:${pass}@${host}:${port}` : `${host}:${port}`;
-
-  // 2. التشفير الأول (الداخلي):
-  const encodedCreds = Buffer.from(credentials, 'utf-8').toString('base64');
-
-  // 3. بناء الرابط:
-  const scheme = protocol === 'http' ? 'http' : 'socks';
-  const uri = `${scheme}://${encodedCreds}#Shamcash-${client.username}`;
-
-  // 4. التشفير الثاني (الخارجي للملف):
-  const finalBase64 = Buffer.from(uri, 'utf-8').toString('base64');
-
-  return finalBase64;
-}
-
 // ============================================================
 // 1. SUBSCRIPTION ENDPOINT: GET /sub/:username
 // Compatible with v2rayNG, V2Box, Streisand, Shadowrocket
@@ -141,9 +118,7 @@ function buildSubscriptionBase64(client, protocol = 'socks') {
 async function handleSubscriptionRequest(req, res) {
   const { username } = req.params;
   const callerIp = getCallerIp(req);
-  const protocol = req.query.type === 'http' ? 'http' : 'socks';
 
-  // 5. الإرسال (Headers ضرورية جداً):
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
 
@@ -154,7 +129,33 @@ async function handleSubscriptionRequest(req, res) {
       return res.status(200).send('');
     }
 
-    const finalBase64 = buildSubscriptionBase64(result.client, protocol);
+    const clientData = result.client;
+
+    // 1. جلب البيانات:
+    const host = clientData.proxy_host;
+    const port = clientData.proxy_port;
+    const pUser = clientData.proxy_username;
+    const pPass = clientData.proxy_password;
+
+    // 2. بناء سلسلة المصادقة ديناميكياً:
+    let credentials = '';
+    if (pUser && pPass) {
+      credentials = `${pUser}:${pPass}@${host}:${port}`;
+    } else {
+      credentials = `${host}:${port}`;
+    }
+
+    // 3. التشفير المزدوج (الصارم لـ v2rayNG):
+    // التشفير الأول
+    const encodedCreds = Buffer.from(credentials, 'utf-8').toString('base64');
+    // بناء الرابط
+    const uri = `socks://${encodedCreds}#Shamcash-${username}`;
+    // التشفير الثاني والنهائي
+    const finalBase64 = Buffer.from(uri, 'utf-8').toString('base64');
+
+    // 4. الإرسال مع الترويسات:
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     return res.status(200).send(finalBase64);
   } catch (err) {
     console.error(`[SUB] Unexpected error for ${username}:`, err);
