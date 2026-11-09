@@ -113,35 +113,25 @@ async function verifyAndBindClient(username, callerIp) {
 
 // Helper function to build Base64 Subscription URI for v2rayNG / V2Box
 function buildSubscriptionBase64(client, protocol = 'socks') {
+  // 1. استخراج بيانات البروكسي:
   const host = String(client.proxy_host).trim();
   const port = Number(client.proxy_port);
-  const encodedTag = encodeURIComponent('Shamcash-' + client.username);
+  const user = client.proxy_user || client.proxy_username;
+  const pass = client.proxy_pass || client.proxy_password;
 
-  // Support optional proxy credentials if present in record
-  const proxyUser = client.proxy_user || client.proxy_username;
-  const proxyPass = client.proxy_pass || client.proxy_password;
+  const credentials = user && pass ? `${user}:${pass}@${host}:${port}` : `${host}:${port}`;
 
-  let uri = '';
+  // 2. التشفير الأول (الداخلي):
+  const encodedCreds = Buffer.from(credentials, 'utf-8').toString('base64');
 
-  if (protocol === 'http') {
-    if (proxyUser && proxyPass) {
-      uri = `http://${encodeURIComponent(proxyUser)}:${encodeURIComponent(proxyPass)}@${host}:${port}#${encodedTag}`;
-    } else {
-      uri = `http://${host}:${port}#${encodedTag}`;
-    }
-  } else {
-    // Standard V2Ray / v2rayNG SOCKS URI scheme:
-    // socks:// + Base64(host:port or user:pass@host:port) + # + encodeURIComponent("Shamcash-" + username)
-    const connectionInfo =
-      proxyUser && proxyPass
-        ? `${proxyUser}:${proxyPass}@${host}:${port}`
-        : `${host}:${port}`;
-    const innerBase64 = Buffer.from(connectionInfo, 'utf-8').toString('base64');
-    uri = `socks://${innerBase64}#${encodedTag}`;
-  }
+  // 3. بناء الرابط:
+  const scheme = protocol === 'http' ? 'http' : 'socks';
+  const uri = `${scheme}://${encodedCreds}#Shamcash-${client.username}`;
 
-  // Final Base64 encoding of the entire subscription content
-  return Buffer.from(uri, 'utf-8').toString('base64');
+  // 4. التشفير الثاني (الخارجي للملف):
+  const finalBase64 = Buffer.from(uri, 'utf-8').toString('base64');
+
+  return finalBase64;
 }
 
 // ============================================================
@@ -153,6 +143,7 @@ async function handleSubscriptionRequest(req, res) {
   const callerIp = getCallerIp(req);
   const protocol = req.query.type === 'http' ? 'http' : 'socks';
 
+  // 5. الإرسال (Headers ضرورية جداً):
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
 
@@ -160,12 +151,11 @@ async function handleSubscriptionRequest(req, res) {
     const result = await verifyAndBindClient(username, callerIp);
 
     if (!result.allowed || !result.client) {
-      // Return empty Base64 response to prevent connection when expired, inactive, or unauthorized
       return res.status(200).send('');
     }
 
-    const base64Payload = buildSubscriptionBase64(result.client, protocol);
-    return res.status(200).send(base64Payload);
+    const finalBase64 = buildSubscriptionBase64(result.client, protocol);
+    return res.status(200).send(finalBase64);
   } catch (err) {
     console.error(`[SUB] Unexpected error for ${username}:`, err);
     return res.status(200).send('');
