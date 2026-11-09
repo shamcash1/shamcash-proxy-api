@@ -112,38 +112,49 @@ async function verifyAndBindClient(username, callerIp) {
 }
 
 // Helper function to build Base64 Subscription URI for v2rayNG / V2Box
-function buildSubscriptionBase64(client, protocol = 'socks5') {
+function buildSubscriptionBase64(client, protocol = 'socks') {
   const host = String(client.proxy_host).trim();
   const port = Number(client.proxy_port);
-  const tag = `Shamcash-${client.username}`;
+  const encodedTag = encodeURIComponent('Shamcash-' + client.username);
 
   // Support optional proxy credentials if present in record
   const proxyUser = client.proxy_user || client.proxy_username;
   const proxyPass = client.proxy_pass || client.proxy_password;
 
-  const scheme = protocol === 'http' ? 'http' : 'socks5';
   let uri = '';
 
-  if (proxyUser && proxyPass) {
-    uri = `${scheme}://${encodeURIComponent(proxyUser)}:${encodeURIComponent(proxyPass)}@${host}:${port}#${tag}`;
+  if (protocol === 'http') {
+    if (proxyUser && proxyPass) {
+      uri = `http://${encodeURIComponent(proxyUser)}:${encodeURIComponent(proxyPass)}@${host}:${port}#${encodedTag}`;
+    } else {
+      uri = `http://${host}:${port}#${encodedTag}`;
+    }
   } else {
-    uri = `${scheme}://${host}:${port}#${tag}`;
+    // Standard V2Ray / v2rayNG SOCKS URI scheme:
+    // socks:// + Base64(host:port or user:pass@host:port) + # + encodeURIComponent("Shamcash-" + username)
+    const connectionInfo =
+      proxyUser && proxyPass
+        ? `${proxyUser}:${proxyPass}@${host}:${port}`
+        : `${host}:${port}`;
+    const innerBase64 = Buffer.from(connectionInfo, 'utf-8').toString('base64');
+    uri = `socks://${innerBase64}#${encodedTag}`;
   }
 
+  // Final Base64 encoding of the entire subscription content
   return Buffer.from(uri, 'utf-8').toString('base64');
 }
 
 // ============================================================
-// 1. NEW SUBSCRIPTION ENDPOINT: GET /sub/:username
+// 1. SUBSCRIPTION ENDPOINT: GET /sub/:username
 // Compatible with v2rayNG, V2Box, Streisand, Shadowrocket
 // ============================================================
 async function handleSubscriptionRequest(req, res) {
   const { username } = req.params;
   const callerIp = getCallerIp(req);
-  const protocol = req.query.type === 'http' ? 'http' : 'socks5';
+  const protocol = req.query.type === 'http' ? 'http' : 'socks';
 
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
 
   try {
     const result = await verifyAndBindClient(username, callerIp);
