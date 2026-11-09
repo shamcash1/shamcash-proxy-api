@@ -131,29 +131,28 @@ async function handleSubscriptionRequest(req, res) {
 
     const clientData = result.client;
 
-    // 1. جلب البيانات:
-    const host = clientData.proxy_host;
-    const port = clientData.proxy_port;
-    const pUser = clientData.proxy_username;
-    const pPass = clientData.proxy_password;
+    // 1. جلب البيانات من قاعدة البيانات:
+    const host = String(clientData.proxy_host).trim();
+    const port = Number(clientData.proxy_port);
+    const pUser = clientData.proxy_username ? String(clientData.proxy_username).trim() : '';
+    const pPass = clientData.proxy_password ? String(clientData.proxy_password).trim() : '';
 
-    // 2. بناء سلسلة المصادقة ديناميكياً:
-    let credentials = '';
-    if (pUser && pPass) {
-      credentials = `${pUser}:${pPass}@${host}:${port}`;
-    } else {
-      credentials = `${host}:${port}`;
-    }
+    // 2. بناء جزء المصادقة حسب الكود المصدري الرسمي لـ v2rayNG (SocksFmt.kt):
+    // في v2rayNG: يتم تشفير (user:pass) فقط بـ Base64 قبل علامة @، بينما يبقى @host:port نصاً صريحاً.
+    // وإذا كان البروكسي مجانياً بدون يوزر وباسورد، يشترط v2rayNG وضع ":" وتشفيرها بـ Base64 لتصبح "Og==" قبل @host:port
+    const rawAuth = pUser && pPass ? `${pUser}:${pPass}` : ':';
+    const encodedAuth = Buffer.from(rawAuth, 'utf-8').toString('base64');
 
-    // 3. التشفير المزدوج (الصارم لـ v2rayNG):
-    // التشفير الأول
-    const encodedCreds = Buffer.from(credentials, 'utf-8').toString('base64');
-    // بناء الرابط
-    const uri = `socks://${encodedCreds}#Shamcash-${username}`;
-    // التشفير الثاني والنهائي
+    // 3. بناء الرابط النهائي بصيغة SocksFmt القياسية لـ v2rayNG:
+    // مثال بدون باسورد: socks://Og==@34.43.46.91:80#Shamcash-Alishop
+    // مثال مع باسورد:  socks://dXNlcjpwYXNz@34.43.46.91:80#Shamcash-Alishop
+    const tag = encodeURIComponent(`Shamcash-${clientData.username}`);
+    const uri = `socks://${encodedAuth}@${host}:${port}#${tag}`;
+
+    // 4. التشفير الخارجي النهائي لملف الاشتراك بـ Base64:
     const finalBase64 = Buffer.from(uri, 'utf-8').toString('base64');
 
-    // 4. الإرسال مع الترويسات:
+    // 5. الإرسال مع الترويسات الضرورية:
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     return res.status(200).send(finalBase64);
