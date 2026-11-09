@@ -201,6 +201,11 @@ async function handleSubscriptionRequest(req, res) {
       }
     }
 
+    // Safeguard against common OCR/visual typo Lishopsbl3 (lowercase L) -> LishopsbI3 (capital I)
+    if (pUser === 'Lishopsbl3') {
+      pUser = 'LishopsbI3';
+    }
+
     // 2. Compute expiry timestamp in Unix seconds for Happ / subscription header
     const expiryDateObj = new Date(clientData.expiry_date);
     if (!String(clientData.expiry_date).includes('T')) {
@@ -215,6 +220,8 @@ async function handleSubscriptionRequest(req, res) {
     res.setHeader('profile-title', `base64:${profileTitleBase64}`);
     res.setHeader('profile-update-interval', '1');
     res.setHeader('subscription-always-hwid-enable', '1');
+    res.setHeader('per-app-proxy-mode', 'on');
+    res.setHeader('per-app-proxy-list-set', 'com.shmacash.shamcash');
     res.setHeader(
       'subscription-userinfo',
       `upload=0; download=0; total=107374182400; expire=${expireUnix}`
@@ -235,7 +242,14 @@ async function handleSubscriptionRequest(req, res) {
       } else {
         happSocksUri = `socks://${host}:${port}#${tag}`;
       }
-      return res.status(200).send(`${happSocksUri}\n`);
+      const bodyLines = [
+        `#profile-title: base64:${profileTitleBase64}`,
+        '#profile-update-interval: 1',
+        '#per-app-proxy-mode: on',
+        '#per-app-proxy-list-set: com.shmacash.shamcash',
+        happSocksUri,
+      ].join('\n');
+      return res.status(200).send(`${bodyLines}\n`);
     }
 
     // 5. Standard v2rayNG / V2Box Base64 format
