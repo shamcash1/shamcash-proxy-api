@@ -237,30 +237,144 @@ async function handleSubscriptionRequest(req, res) {
 
     const tag = encodeURIComponent(`VPN Alishop - ${clientData.username}`);
 
-    // 4. If requested by Happ (or with HWID header), return Happ's native plain-text subscription format
-    // along with inline #directive comments so both header and body delivery methods are guaranteed
+    // 4. If requested by Happ (or with HWID header), return a complete Xray JSON Array configuration
+    // Why JSON instead of socks:// URI:
+    // - AstroProxy SOCKS5 strictly forbids raw IP connections (ATYP=0x01 -> 35 bytes -> SOCKS5 Error 2)
+    //   and requires the domain name (ATYP=0x03).
+    // - In Happ's default socks:// URL generator, sniffing has "routeOnly": true, which sends the raw IP
+    //   191.44.71.71 (35B) to AstroProxy and gets rejected.
+    // - By passing a 1:1 Xray JSON config with "routeOnly": false and "domainStrategy": "AsIs", Xray
+    //   sniffs the TLS SNI (api.shamcash.sy, bank.shamcash.sy, payment.shamcash.sy, api-02.shamcash.sy)
+    //   and overwrites the raw IP with the domain name before connecting to the Syrian SOCKS5 proxy.
     const isHappClient = ua.includes('happ') || Boolean(callerHwid) || req.query?.client === 'happ';
 
     if (isHappClient) {
-      let happSocksUri = '';
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+
+      const socksServer = {
+        address: host,
+        port: port,
+      };
       if (pUser && pPass) {
-        const encodedUserPass = Buffer.from(`${pUser}:${pPass}`, 'utf-8').toString('base64');
-        happSocksUri = `socks://${encodedUserPass}@${host}:${port}#${tag}`;
-      } else {
-        happSocksUri = `socks://${host}:${port}#${tag}`;
+        socksServer.users = [
+          {
+            user: pUser,
+            pass: pPass,
+            level: 8,
+          },
+        ];
       }
 
-      const happBody = [
-        `#profile-title: base64:${profileTitleBase64}`,
-        '#profile-update-interval: 1',
-        '#subscription-always-hwid-enable: 1',
-        '#routing-enable: 0',
-        `#exclude-routes-set: ${excludedDnsAndLanRoutes}`,
-        '#no-limit-enabled: 1',
-        happSocksUri,
-      ].join('\n');
+      const xrayConfig = {
+        remarks: `VPN Alishop - ${clientData.username}`,
+        meta: {
+          serverDescription: 'Syria ShamCash Direct TCP',
+        },
+        log: {
+          loglevel: 'warning',
+        },
+        dns: {
+          hosts: {
+            'cloudflare-dns.com': '1.1.1.1',
+            'dns.google': '8.8.8.8',
+          },
+          servers: ['1.1.1.1', '8.8.8.8'],
+        },
+        inbounds: [
+          {
+            tag: 'socks',
+            port: 10808,
+            listen: '127.0.0.1',
+            protocol: 'socks',
+            settings: {
+              auth: 'noauth',
+              udp: true,
+              userLevel: 8,
+            },
+            sniffing: {
+              enabled: true,
+              destOverride: ['http', 'tls'],
+              routeOnly: false,
+            },
+          },
+          {
+            tag: 'http',
+            port: 10809,
+            listen: '127.0.0.1',
+            protocol: 'http',
+            settings: {
+              userLevel: 8,
+            },
+            sniffing: {
+              enabled: true,
+              destOverride: ['http', 'tls'],
+              routeOnly: false,
+            },
+          },
+        ],
+        outbounds: [
+          {
+            tag: 'proxy',
+            protocol: 'socks',
+            settings: {
+              servers: [socksServer],
+            },
+            streamSettings: {
+              network: 'tcp',
+            },
+          },
+          {
+            tag: 'direct',
+            protocol: 'freedom',
+            settings: {},
+          },
+          {
+            tag: 'block',
+            protocol: 'blackhole',
+            settings: {
+              response: {
+                type: 'none',
+              },
+            },
+          },
+        ],
+        routing: {
+          domainStrategy: 'AsIs',
+          rules: [
+            {
+              type: 'field',
+              port: 53,
+              outboundTag: 'direct',
+            },
+            {
+              type: 'field',
+              ip: [
+                '1.1.1.1',
+                '1.0.0.1',
+                '8.8.8.8',
+                '8.8.4.4',
+                '9.9.9.9',
+                '10.0.0.0/8',
+                '172.16.0.0/12',
+                '192.168.0.0/16',
+              ],
+              outboundTag: 'direct',
+            },
+            {
+              type: 'field',
+              network: 'udp',
+              outboundTag: 'block',
+            },
+            {
+              type: 'field',
+              network: 'tcp',
+              outboundTag: 'proxy',
+            },
+          ],
+        },
+      };
 
-      return res.status(200).send(`${happBody}\n`);
+      return res.status(200).send(JSON.stringify([xrayConfig], null, 2));
     }
 
     // 5. Standard v2rayNG / V2Box Base64 format
