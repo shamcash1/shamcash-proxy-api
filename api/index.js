@@ -24,7 +24,7 @@ app.use((req, res, next) => {
   );
   res.header(
     'Access-Control-Expose-Headers',
-    'profile-title, profile-update-interval, subscription-userinfo, subscription-always-hwid-enable, routing, content-disposition'
+    'profile-title, profile-update-interval, subscription-userinfo, subscription-always-hwid-enable, routing-enable, exclude-routes, exclude-routes-set, no-limit-enabled, content-disposition'
   );
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
@@ -214,15 +214,22 @@ async function handleSubscriptionRequest(req, res) {
     const expireUnix = Math.floor(expiryDateObj.getTime() / 1000);
 
     // 3. Set Official Happ App Management & Subscription Headers
-    // Do NOT send a custom 'routing' header because importing a custom routing profile forces Happ
-    // to download external geoip.dat/geosite.dat files. Without the 'routing' header, Happ uses its
-    // built-in pre-installed geo files and native DoH configuration with zero download errors.
+    // - routing-enable: 0 disables custom GeoIP/GeoSite routing so Happ never attempts to download 30MB geo files
+    // - exclude-routes-set excludes Happ's tunnel DNS (1.1.1.1) and public DNS servers from the VPN tunnel (tun0)
+    //   so Android UDP port 53 DNS queries resolve directly in 10ms via the user's real connection instead of
+    //   getting dropped as 35-byte UDP packets inside the TCP-only SOCKS5 proxy
     const profileTitlePlain = `VPN Alishop - ${clientData.username}`.slice(0, 25);
     const profileTitleBase64 = Buffer.from(profileTitlePlain, 'utf-8').toString('base64');
+    const excludedDnsAndLanRoutes =
+      '1.1.1.1/32, 1.0.0.1/32, 8.8.8.8/32, 8.8.4.4/32, 9.9.9.9/32, 149.112.112.112/32, 208.67.222.222/32, 208.67.220.220/32, 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12';
 
     res.setHeader('profile-title', `base64:${profileTitleBase64}`);
     res.setHeader('profile-update-interval', '1');
     res.setHeader('subscription-always-hwid-enable', '1');
+    res.setHeader('routing-enable', '0');
+    res.setHeader('exclude-routes-set', excludedDnsAndLanRoutes);
+    res.setHeader('exclude-routes', excludedDnsAndLanRoutes);
+    res.setHeader('no-limit-enabled', '1');
     res.setHeader(
       'subscription-userinfo',
       `upload=0; download=0; total=107374182400; expire=${expireUnix}`
@@ -231,8 +238,7 @@ async function handleSubscriptionRequest(req, res) {
     const tag = encodeURIComponent(`VPN Alishop - ${clientData.username}`);
 
     // 4. If requested by Happ (or with HWID header), return Happ's native plain-text subscription format
-    // Per https://www.happ.su/main/dev-docs/examples-of-links-and-parameters.md:
-    // Plain text: socks://user:pass@1.2.3.4:443#Name or Partial Base64: socks://<base64_user_pass>@1.2.3.4:443#Name
+    // along with inline #directive comments so both header and body delivery methods are guaranteed
     const isHappClient = ua.includes('happ') || Boolean(callerHwid) || req.query?.client === 'happ';
 
     if (isHappClient) {
@@ -243,7 +249,18 @@ async function handleSubscriptionRequest(req, res) {
       } else {
         happSocksUri = `socks://${host}:${port}#${tag}`;
       }
-      return res.status(200).send(`${happSocksUri}\n`);
+
+      const happBody = [
+        `#profile-title: base64:${profileTitleBase64}`,
+        '#profile-update-interval: 1',
+        '#subscription-always-hwid-enable: 1',
+        '#routing-enable: 0',
+        `#exclude-routes-set: ${excludedDnsAndLanRoutes}`,
+        '#no-limit-enabled: 1',
+        happSocksUri,
+      ].join('\n');
+
+      return res.status(200).send(`${happBody}\n`);
     }
 
     // 5. Standard v2rayNG / V2Box Base64 format
