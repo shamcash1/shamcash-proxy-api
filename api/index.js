@@ -223,8 +223,6 @@ async function handleSubscriptionRequest(req, res) {
     res.setHeader('profile-title', `base64:${profileTitleBase64}`);
     res.setHeader('profile-update-interval', '1');
     res.setHeader('subscription-always-hwid-enable', '1');
-    res.setHeader('per-app-proxy-mode', 'on');
-    res.setHeader('per-app-proxy-list-set', 'com.shmacash.shamcash');
     res.setHeader(
       'subscription-userinfo',
       `upload=0; download=0; total=107374182400; expire=${expireUnix}`
