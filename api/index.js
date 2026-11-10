@@ -214,57 +214,15 @@ async function handleSubscriptionRequest(req, res) {
     const expireUnix = Math.floor(expiryDateObj.getTime() / 1000);
 
     // 3. Set Official Happ App Management & Subscription Headers
+    // Do NOT send a custom 'routing' header because importing a custom routing profile forces Happ
+    // to download external geoip.dat/geosite.dat files. Without the 'routing' header, Happ uses its
+    // built-in pre-installed geo files and native DoH configuration with zero download errors.
     const profileTitlePlain = `VPN Alishop - ${clientData.username}`.slice(0, 25);
     const profileTitleBase64 = Buffer.from(profileTitlePlain, 'utf-8').toString('base64');
-
-    const happDefaultDohProfile = {
-      Name: 'ShamCash Fix',
-      GlobalProxy: 'true',
-      RouteOrder: 'block-proxy-direct',
-      RemoteDNSType: 'DoH',
-      RemoteDNSDomain: 'https://cloudflare-dns.com/dns-query',
-      RemoteDNSIP: '1.1.1.1',
-      DomesticDNSType: 'DoH',
-      DomesticDNSDomain: 'https://dns.google/dns-query',
-      DomesticDNSIP: '8.8.8.8',
-      Geoipurl: 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat',
-      Geositeurl: 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat',
-      LastUpdated: String(Math.floor(Date.now() / 1000)),
-      DnsHosts: {
-        'cloudflare-dns.com': '1.1.1.1',
-        'dns.google': '8.8.8.8',
-      },
-      DirectSites: [],
-      DirectIp: [
-        '8.8.8.8',
-        '8.8.4.4',
-        '10.0.0.0/8',
-        '172.16.0.0/12',
-        '192.168.0.0/16',
-        '169.254.0.0/16',
-        '224.0.0.0/4',
-        '255.255.255.255',
-      ],
-      ProxySites: [],
-      ProxyIp: [],
-      BlockSites: [],
-      BlockIp: [],
-      DomainStrategy: 'AsIs',
-      FakeDNS: 'false',
-      UseChunkFiles: 'true',
-    };
-
-    const routingBase64 = Buffer.from(JSON.stringify(happDefaultDohProfile), 'utf-8')
-      .toString('base64')
-      .replace(/\+/g, '-')
-      .replace(/\//g, '_')
-      .replace(/=+$/g, '');
 
     res.setHeader('profile-title', `base64:${profileTitleBase64}`);
     res.setHeader('profile-update-interval', '1');
     res.setHeader('subscription-always-hwid-enable', '1');
-    res.setHeader('routing-enable', '1');
-    res.setHeader('routing', `happ://routing/onadd/${routingBase64}`);
     res.setHeader('per-app-proxy-mode', 'on');
     res.setHeader('per-app-proxy-list-set', 'com.shmacash.shamcash');
     res.setHeader(
