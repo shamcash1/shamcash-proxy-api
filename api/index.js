@@ -226,6 +226,7 @@ async function handleSubscriptionRequest(req, res) {
     res.setHeader('profile-title', `base64:${profileTitleBase64}`);
     res.setHeader('profile-update-interval', '1');
     res.setHeader('subscription-always-hwid-enable', '1');
+    res.setHeader('subscription-ping-onopen-enabled', '0');
     res.setHeader('routing-enable', '0');
     res.setHeader('exclude-routes-set', excludedDnsAndLanRoutes);
     res.setHeader('exclude-routes', excludedDnsAndLanRoutes);
@@ -238,14 +239,11 @@ async function handleSubscriptionRequest(req, res) {
     const tag = encodeURIComponent(`VPN Alishop - ${clientData.username}`);
 
     // 4. If requested by Happ (or with HWID header), return a complete Xray JSON Array configuration
-    // Why JSON instead of socks:// URI:
-    // - AstroProxy SOCKS5 strictly forbids raw IP connections (ATYP=0x01 -> 35 bytes -> SOCKS5 Error 2)
-    //   and requires the domain name (ATYP=0x03).
-    // - In Happ's default socks:// URL generator, sniffing has "routeOnly": true, which sends the raw IP
-    //   191.44.71.71 (35B) to AstroProxy and gets rejected.
-    // - By passing a 1:1 Xray JSON config with "routeOnly": false and "domainStrategy": "AsIs", Xray
-    //   sniffs the TLS SNI (api.shamcash.sy, bank.shamcash.sy, payment.shamcash.sy, api-02.shamcash.sy)
-    //   and overwrites the raw IP with the domain name before connecting to the Syrian SOCKS5 proxy.
+    // with ULTRA-LOW BANDWIDTH SPLIT-TUNNELING:
+    // - ONLY Sham Cash API domains (*.shamcash.sy, *.shamcash.org) are routed through "proxy".
+    // - Heavy APK downloads (download.shamcash.sy) and ALL other apps/system services (Google Play,
+    //   Firebase, YouTube, WhatsApp, OS background sync) are routed to "direct" (0 proxy bandwidth used!).
+    // - "routeOnly": false + "domainStrategy": "AsIs" ensures TLS SNI domain names are sent to the proxy.
     const isHappClient = ua.includes('happ') || Boolean(callerHwid) || req.query?.client === 'happ';
 
     if (isHappClient) {
@@ -268,7 +266,7 @@ async function handleSubscriptionRequest(req, res) {
       const xrayConfig = {
         remarks: `VPN Alishop - ${clientData.username}`,
         meta: {
-          serverDescription: 'Syria ShamCash Direct TCP',
+          serverDescription: 'ShamCash Only (Ultra-Low Data)',
         },
         log: {
           loglevel: 'warning',
@@ -314,6 +312,11 @@ async function handleSubscriptionRequest(req, res) {
         ],
         outbounds: [
           {
+            tag: 'direct',
+            protocol: 'freedom',
+            settings: {},
+          },
+          {
             tag: 'proxy',
             protocol: 'socks',
             settings: {
@@ -322,11 +325,6 @@ async function handleSubscriptionRequest(req, res) {
             streamSettings: {
               network: 'tcp',
             },
-          },
-          {
-            tag: 'direct',
-            protocol: 'freedom',
-            settings: {},
           },
           {
             tag: 'block',
@@ -348,27 +346,46 @@ async function handleSubscriptionRequest(req, res) {
             },
             {
               type: 'field',
-              ip: [
-                '1.1.1.1',
-                '1.0.0.1',
-                '8.8.8.8',
-                '8.8.4.4',
-                '9.9.9.9',
-                '10.0.0.0/8',
-                '172.16.0.0/12',
-                '192.168.0.0/16',
-              ],
-              outboundTag: 'direct',
-            },
-            {
-              type: 'field',
               network: 'udp',
               outboundTag: 'block',
             },
             {
               type: 'field',
-              network: 'tcp',
+              domain: [
+                'full:download.shamcash.sy',
+                'domain:googleapis.com',
+                'domain:gstatic.com',
+                'domain:google.com',
+                'domain:firebaseio.com',
+                'domain:crashlytics.com',
+                'domain:slsandbox.tech',
+              ],
+              outboundTag: 'direct',
+            },
+            {
+              type: 'field',
+              domain: [
+                'domain:api.shamcash.sy',
+                'domain:api-02.shamcash.sy',
+                'domain:api-03.shamcash.sy',
+                'domain:bank.shamcash.sy',
+                'domain:payment.shamcash.sy',
+                'domain:support.shamcash.sy',
+                'domain:deeplink.shamcash.sy',
+                'domain:shamcash.sy',
+                'domain:shamcash.org',
+              ],
               outboundTag: 'proxy',
+            },
+            {
+              type: 'field',
+              ip: ['191.44.71.71/32', '94.252.183.88/32'],
+              outboundTag: 'proxy',
+            },
+            {
+              type: 'field',
+              network: 'tcp,udp',
+              outboundTag: 'direct',
             },
           ],
         },
