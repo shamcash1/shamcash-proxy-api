@@ -26,7 +26,7 @@ app.use((req, res, next) => {
   );
   res.header(
     'Access-Control-Expose-Headers',
-    'profile-title, profile-update-interval, subscription-userinfo, subscription-always-hwid-enable, subscription-auto-update-enable, subscription-auto-update-open-enable, subscriptions-expand-now, hide-settings, routing-enable, per-app-proxy-mode, per-app-proxy-list, per-app-proxy-list-set, exclude-routes, exclude-routes-set, no-limit-enabled, content-disposition'
+    'profile-title, profile-update-interval, subscription-userinfo, subscription-always-hwid-enable, subscription-auto-update-enable, subscription-auto-update-open-enable, subscriptions-expand-now, hide-settings, routing-enable, per-app-proxy-mode, per-app-proxy-list, exclude-routes, exclude-routes-set, no-limit-enabled, content-disposition'
   );
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
@@ -307,9 +307,8 @@ async function handleSubscriptionRequest(req, res) {
   const { username } = req.params;
   const callerIp = getCallerIp(req);
   const callerHwid = getCallerHwid(req);
-  // Always serve the strict Xray JSON configuration with ShamCash-only routing rules
-  // unless ?format=raw_socks is explicitly requested, so no device ever gets an unfiltered socks:// link.
-  const forceRawSocks = req.query?.format === 'raw_socks';
+  const ua = String(req.headers['user-agent'] || '').toLowerCase();
+  const isHappClient = ua.includes('happ') || Boolean(callerHwid) || req.query?.client === 'happ';
 
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
@@ -325,15 +324,10 @@ async function handleSubscriptionRequest(req, res) {
   res.setHeader('subscription-always-hwid-enable', '1');
   res.setHeader('subscription-ping-onopen-enabled', '0');
   res.setHeader('hide-settings', '1');
-  // CRITICAL FIX:
-  // Set routing-enable: 0 so Happ does NOT enable its built-in Default Routing Profile ("GlobalProxy": "true"),
-  // which previously overwrote our JSON routing rules and sent non-ShamCash domains (kazawallet, syriancrypto, etc.) to the proxy!
-  // With routing-enable: 0, Xray-core strictly executes the routing.rules inside our JSON configuration.
-  res.setHeader('routing-enable', '0');
-  // Also enforce Android OS-level Per-App Proxy for ShamCash ONLY (both standard and -set overwrite header)
+  // CRITICAL: Enable Xray routing engine (routing-enable: 1) AND Android OS-level Per-App Proxy for ShamCash ONLY!
+  res.setHeader('routing-enable', '1');
   res.setHeader('per-app-proxy-mode', 'on');
   res.setHeader('per-app-proxy-list', 'com.shmacash.shamcash');
-  res.setHeader('per-app-proxy-list-set', 'com.shmacash.shamcash');
   res.setHeader('exclude-routes-set', excludedDnsAndLanRoutes);
   res.setHeader('exclude-routes', excludedDnsAndLanRoutes);
   res.setHeader('no-limit-enabled', '1');
@@ -398,7 +392,7 @@ async function handleSubscriptionRequest(req, res) {
         `upload=0; download=${limitBytes}; total=${limitBytes}; expire=1000000000`
       );
 
-      if (!forceRawSocks) {
+      if (isHappClient) {
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
         const disabledConfig = {
           remarks: `⛔ متوقف - ${cleanTitleName}`,
@@ -459,13 +453,13 @@ async function handleSubscriptionRequest(req, res) {
 
     const tag = encodeURIComponent(`VPN Alishop - ${clientData.username}`);
 
-    // 4. Return complete Xray JSON Array configuration with STRICT SHAMCASH-ONLY WHITELIST:
-    // - Outbound #0 is "block" (blackhole) so any unmatched traffic is dropped by default.
-    // - Static object storage (your-objectstorage.com) goes to "direct" (local Wi-Fi/4G, 0 proxy bytes).
-    // - Non-ShamCash Syrian sites (kazawallet.com, syriancrypto.com, syriatel.com.sy, kasroad.com)
-    //   and social/tracking SDKs (facebook.net, googleapis, etc.) are explicitly blocked from using the proxy.
-    // - ONLY Sham Cash API & core domains (*.shamcash.sy, *.shamcash.org) are routed through "proxy".
-    if (!forceRawSocks) {
+    // 4. If requested by Happ (or with HWID header), return a complete Xray JSON Array configuration
+    // with ULTRA-LOW BANDWIDTH SPLIT-TUNNELING:
+    // - ONLY Sham Cash API domains (*.shamcash.sy, *.shamcash.org) are routed through "proxy".
+    // - Heavy APK downloads (download.shamcash.sy) and ALL other apps/system services (Google Play,
+    //   Firebase, YouTube, WhatsApp, OS background sync) are routed to "direct" (0 proxy bandwidth used!).
+    // - "routeOnly": false + "domainStrategy": "AsIs" ensures TLS SNI domain names are sent to the proxy.
+    if (isHappClient) {
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
 
       const socksServer = {
@@ -516,7 +510,7 @@ async function handleSubscriptionRequest(req, res) {
             },
             sniffing: {
               enabled: true,
-              destOverride: ['http', 'tls', 'quic'],
+              destOverride: ['http', 'tls'],
               routeOnly: false,
             },
           },
@@ -530,7 +524,7 @@ async function handleSubscriptionRequest(req, res) {
             },
             sniffing: {
               enabled: true,
-              destOverride: ['http', 'tls', 'quic'],
+              destOverride: ['http', 'tls'],
               routeOnly: false,
             },
           },
@@ -577,22 +571,7 @@ async function handleSubscriptionRequest(req, res) {
             {
               type: 'field',
               domain: [
-                'domain:your-objectstorage.com',
-                'full:fsn1.your-objectstorage.com',
-              ],
-              outboundTag: 'direct',
-            },
-            {
-              type: 'field',
-              domain: [
                 'full:download.shamcash.sy',
-                'domain:kazawallet.com',
-                'domain:syriancrypto.com',
-                'domain:syriatel.com.sy',
-                'domain:kasroad.com',
-                'domain:facebook.net',
-                'domain:facebook.com',
-                'domain:fbcdn.net',
                 'domain:googleapis.com',
                 'domain:gstatic.com',
                 'domain:google.com',
@@ -600,6 +579,8 @@ async function handleSubscriptionRequest(req, res) {
                 'domain:crashlytics.com',
                 'domain:slsandbox.tech',
                 'domain:instagram.com',
+                'domain:facebook.com',
+                'domain:fbcdn.net',
                 'domain:wechat.com',
                 'domain:whatsapp.com',
                 'domain:whatsapp.net',
@@ -608,24 +589,19 @@ async function handleSubscriptionRequest(req, res) {
                 'domain:googlevideo.com',
                 'domain:perfectcdn.com',
                 'domain:smmraydar.com',
-                'domain:apple.com',
-                'domain:icloud.com',
               ],
               outboundTag: 'block',
             },
             {
               type: 'field',
               domain: [
-                'full:api.shamcash.sy',
-                'full:api-02.shamcash.sy',
-                'full:api-03.shamcash.sy',
-                'full:app.shamcash.sy',
-                'full:bank.shamcash.sy',
-                'full:payment.shamcash.sy',
-                'full:support.shamcash.sy',
-                'full:deeplink.shamcash.sy',
-                'full:shamcash.sy',
-                'full:www.shamcash.sy',
+                'domain:api.shamcash.sy',
+                'domain:api-02.shamcash.sy',
+                'domain:api-03.shamcash.sy',
+                'domain:bank.shamcash.sy',
+                'domain:payment.shamcash.sy',
+                'domain:support.shamcash.sy',
+                'domain:deeplink.shamcash.sy',
                 'domain:shamcash.sy',
                 'domain:shamcash.org',
               ],
@@ -648,7 +624,7 @@ async function handleSubscriptionRequest(req, res) {
       return res.status(200).send(JSON.stringify([xrayConfig], null, 2));
     }
 
-    // 5. Fallback raw socks format (only if ?format=raw_socks is explicitly passed)
+    // 5. Standard v2rayNG / V2Box Base64 format
     const rawAuth = pUser && pPass ? `${pUser}:${pPass}` : ':';
     const encodedAuth = Buffer.from(rawAuth, 'utf-8').toString('base64');
     const uri = `socks://${encodedAuth}@${host}:${port}#${tag}`;
