@@ -482,6 +482,15 @@ function verifyAdminBearerToken(token, vaultSalt = '') {
   }
 }
 
+function normalizeAdminIp(ip) {
+  const clean = String(ip || '')
+    .trim()
+    .replace(/^::ffff:/i, '')
+    .toLowerCase();
+  if (!clean || clean === 'unknown') return '';
+  return clean;
+}
+
 async function getStoredAdminVault() {
   try {
     const { data } = await supabase
@@ -491,13 +500,26 @@ async function getStoredAdminVault() {
       .maybeSingle();
     if (data && data.proxy_host) {
       const parsed = JSON.parse(data.proxy_host);
-      if (parsed && parsed.salt && parsed.hash) {
+      if (parsed && typeof parsed === 'object') {
+        const hasCredentials = Boolean(parsed.salt && parsed.hash);
+        const trustedIps = Array.isArray(parsed.trusted_ips)
+          ? parsed.trusted_ips.map(normalizeAdminIp).filter(Boolean)
+          : [];
+        const lockedOrphans =
+          parsed.locked_orphans && typeof parsed.locked_orphans === 'object'
+            ? parsed.locked_orphans
+            : {};
         return {
           rowId: data.id,
-          salt: String(parsed.salt),
-          hash: String(parsed.hash),
+          has_credentials: hasCredentials,
+          salt: hasCredentials ? String(parsed.salt) : '',
+          hash: hasCredentials ? String(parsed.hash) : '',
           has_pattern: Boolean(parsed.has_pattern),
           claimed_at: parsed.claimed_at || null,
+          trusted_ips: trustedIps,
+          leak_baseline_date: typeof parsed.leak_baseline_date === 'string' ? parsed.leak_baseline_date : '',
+          leak_baseline_default_bytes: Number(parsed.leak_baseline_default_bytes || 0),
+          locked_orphans: lockedOrphans,
         };
       }
     }
@@ -505,6 +527,72 @@ async function getStoredAdminVault() {
     // not configured yet
   }
   return null;
+}
+
+async function saveStoredAdminVault(patch) {
+  try {
+    const existing = await getStoredAdminVault();
+    const mergedPayload = {
+      ...(existing?.salt ? { salt: existing.salt } : {}),
+      ...(existing?.hash ? { hash: existing.hash } : {}),
+      has_pattern: existing?.has_pattern ?? false,
+      claimed_at: existing?.claimed_at || null,
+      trusted_ips: Array.isArray(existing?.trusted_ips) ? existing.trusted_ips : [],
+      leak_baseline_date: existing?.leak_baseline_date || '',
+      leak_baseline_default_bytes: Number(existing?.leak_baseline_default_bytes || 0),
+      locked_orphans: existing?.locked_orphans || {},
+      ...patch,
+    };
+
+    const serialized = JSON.stringify(mergedPayload);
+    if (existing?.rowId) {
+      const { error } = await supabase
+        .from('proxy_clients')
+        .update({
+          proxy_host: serialized,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', existing.rowId);
+      return !error;
+    }
+
+    const { error } = await supabase.from('proxy_clients').insert([
+      {
+        username: SYSTEM_ADMIN_VAULT_USERNAME,
+        is_active: false,
+        expiry_date: '2099-12-31',
+        proxy_host: serialized,
+        proxy_port: 443,
+      },
+    ]);
+    return !error;
+  } catch (err) {
+    console.error('[ADMIN-VAULT] Failed to update vault metadata:', err);
+    return false;
+  }
+}
+
+async function addTrustedAdminIp(ip) {
+  const normalized = normalizeAdminIp(ip);
+  if (!normalized) return;
+  const existing = await getStoredAdminVault();
+  const current = Array.isArray(existing?.trusted_ips) ? existing.trusted_ips : [];
+  const next = [normalized, ...current.filter((item) => item !== normalized)].slice(0, 12);
+  await saveStoredAdminVault({ trusted_ips: next });
+}
+
+async function removeTrustedAdminIp(ip, removeAll = false) {
+  const existing = await getStoredAdminVault();
+  if (!existing) return;
+  if (removeAll) {
+    await saveStoredAdminVault({ trusted_ips: [] });
+    return;
+  }
+  const normalized = normalizeAdminIp(ip);
+  if (!normalized) return;
+  const current = Array.isArray(existing.trusted_ips) ? existing.trusted_ips : [];
+  const next = current.filter((item) => item !== normalized);
+  await saveStoredAdminVault({ trusted_ips: next });
 }
 
 function getRateLimitState(ip) {
@@ -548,7 +636,7 @@ async function requireAdminAuth(req, res, next) {
   }
   const envPass = getEnvAdminPasscode();
   const storedVault = envPass ? null : await getStoredAdminVault();
-  const salt = storedVault?.salt || '';
+  const salt = storedVault?.has_credentials ? storedVault.salt : '';
   if (!verifyAdminBearerToken(token, salt)) {
     return res.status(401).json({ success: false, error: 'انتهت جلسة الخزنة أو الرمز غير صالح' });
   }
@@ -558,15 +646,41 @@ async function requireAdminAuth(req, res, next) {
 async function handleAdminStatus(req, res) {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   const envPass = getEnvAdminPasscode();
-  const storedVault = envPass ? null : await getStoredAdminVault();
-  const configured = Boolean(envPass || storedVault);
+  const storedVault = await getStoredAdminVault();
+  const configured = Boolean(envPass || storedVault?.has_credentials);
+  const signingSalt = envPass ? '' : storedVault?.salt || '';
   const token = extractBearerToken(req);
-  const authenticated = configured && verifyAdminBearerToken(token, storedVault?.salt || '');
+  const tokenValid = configured && verifyAdminBearerToken(token, signingSalt);
+
+  if (tokenValid) {
+    return res.json({
+      configured,
+      env_override: Boolean(envPass),
+      authenticated: true,
+      auto_unlocked: false,
+    });
+  }
+
+  // Trusted-IP One-Time Verification: auto-unlock seamlessly if caller IP was previously verified
+  const callerIp = normalizeAdminIp(getCallerIp(req));
+  const trustedIps = Array.isArray(storedVault?.trusted_ips) ? storedVault.trusted_ips : [];
+  if (configured && callerIp && trustedIps.includes(callerIp)) {
+    const freshToken = signAdminBearerToken(signingSalt);
+    return res.json({
+      configured,
+      env_override: Boolean(envPass),
+      authenticated: true,
+      auto_unlocked: true,
+      trusted_ip: callerIp,
+      token: freshToken,
+    });
+  }
 
   return res.json({
     configured,
     env_override: Boolean(envPass),
-    authenticated,
+    authenticated: false,
+    auto_unlocked: false,
   });
 }
 
@@ -581,7 +695,7 @@ async function handleAdminClaim(req, res) {
   }
 
   const existing = await getStoredAdminVault();
-  if (existing) {
+  if (existing?.has_credentials) {
     return res.status(403).json({
       success: false,
       error: 'الخزنة السرية مفعّلة ومقفلة مسبقاً',
@@ -607,36 +721,29 @@ async function handleAdminClaim(req, res) {
 
   const combined = `${patternNodes.join('-')}::${passphrase}`;
   const { salt, hash } = hashVaultCredential(combined);
-  const vaultPayload = JSON.stringify({
+  const callerIp = normalizeAdminIp(getCallerIp(req));
+  const trustedIps = callerIp ? [callerIp] : [];
+
+  // Re-check right before saving to prevent race condition
+  const doubleCheck = await getStoredAdminVault();
+  if (doubleCheck?.has_credentials) {
+    return res.status(403).json({ success: false, error: 'الخزنة السرية مفعّلة مسبقاً' });
+  }
+
+  const saved = await saveStoredAdminVault({
     salt,
     hash,
     has_pattern: true,
     claimed_at: new Date().toISOString(),
+    trusted_ips: trustedIps,
   });
 
-  // Re-check right before insert to prevent race condition
-  const doubleCheck = await getStoredAdminVault();
-  if (doubleCheck) {
-    return res.status(403).json({ success: false, error: 'الخزنة السرية مفعّلة مسبقاً' });
-  }
-
-  const { error } = await supabase.from('proxy_clients').insert([
-    {
-      username: SYSTEM_ADMIN_VAULT_USERNAME,
-      is_active: false,
-      expiry_date: '2099-12-31',
-      proxy_host: vaultPayload,
-      proxy_port: 443,
-    },
-  ]);
-
-  if (error) {
-    console.error('[ADMIN-VAULT] Failed to save vault:', error);
+  if (!saved) {
     return res.status(500).json({ success: false, error: 'تعذر حفظ إعدادات الخزنة في قاعدة البيانات' });
   }
 
   const token = signAdminBearerToken(salt);
-  return res.status(201).json({ success: true, token });
+  return res.status(201).json({ success: true, token, trusted_ip: callerIp || null });
 }
 
 async function handleAdminUnlock(req, res) {
@@ -668,12 +775,13 @@ async function handleAdminUnlock(req, res) {
       });
     }
     VAULT_RATE_LIMIT_MAP.delete(callerIp);
+    await addTrustedAdminIp(callerIp);
     const token = signAdminBearerToken('');
-    return res.json({ success: true, token });
+    return res.json({ success: true, token, trusted_ip: normalizeAdminIp(callerIp) || null });
   }
 
   const storedVault = await getStoredAdminVault();
-  if (!storedVault) {
+  if (!storedVault?.has_credentials) {
     return res.status(400).json({
       success: false,
       error: 'يرجى إعداد قفل الخزنة لأول مرة أولاً',
@@ -694,8 +802,17 @@ async function handleAdminUnlock(req, res) {
   }
 
   VAULT_RATE_LIMIT_MAP.delete(callerIp);
+  await addTrustedAdminIp(callerIp);
   const token = signAdminBearerToken(storedVault.salt);
-  return res.json({ success: true, token });
+  return res.json({ success: true, token, trusted_ip: normalizeAdminIp(callerIp) || null });
+}
+
+async function handleAdminLock(req, res) {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  const callerIp = normalizeAdminIp(getCallerIp(req));
+  const lockAll = Boolean(req.body?.lock_all);
+  await removeTrustedAdminIp(callerIp, lockAll);
+  return res.json({ success: true, locked: true, removed_ip: callerIp || null });
 }
 
 app.get('/admin/status', handleAdminStatus);
@@ -704,6 +821,8 @@ app.post('/admin/claim', handleAdminClaim);
 app.post('/api/admin/claim', handleAdminClaim);
 app.post('/admin/unlock', handleAdminUnlock);
 app.post('/api/admin/unlock', handleAdminUnlock);
+app.post('/admin/lock', requireAdminAuth, handleAdminLock);
+app.post('/api/admin/lock', requireAdminAuth, handleAdminLock);
 
 // Enforce server-side Admin Vault Bearer authentication on ALL proxy-provider & external V2Ray control endpoints
 app.use('/nodemaven', requireAdminAuth);
@@ -1845,10 +1964,21 @@ async function computeUnregisteredLeakAlert(subUsersMap) {
     const allSubUsers = Object.values(subUsersMap);
     const defaultUser = allSubUsers.find((u) => u.is_default_user) || null;
 
-    // 1. Fetch registered proxy_clients from Supabase to detect orphan & paused-but-open sub-users
-    const { data: clientRows } = await supabase
-      .from('proxy_clients')
-      .select('username, is_active, proxy_host');
+    // 1. Fetch registered proxy_clients + vault baseline metadata from Supabase
+    const [{ data: clientRows }, vaultMeta] = await Promise.all([
+      supabase.from('proxy_clients').select('username, is_active, proxy_host'),
+      getStoredAdminVault(),
+    ]);
+
+    const lockedOrphansMap =
+      vaultMeta?.locked_orphans && typeof vaultMeta.locked_orphans === 'object'
+        ? vaultMeta.locked_orphans
+        : {};
+    const todayStr = formatNodeMavenDate(new Date());
+    const baselineBytesToday =
+      vaultMeta?.leak_baseline_date === todayStr
+        ? Number(vaultMeta.leak_baseline_default_bytes || 0)
+        : 0;
 
     const activeProxyPrefixes = new Set();
     const pausedClientsByPrefix = new Map();
@@ -1887,11 +2017,18 @@ async function computeUnregisteredLeakAlert(subUsersMap) {
 
       const isRegisteredActive = activeProxyPrefixes.has(key);
       const pausedDashboardUser = pausedClientsByPrefix.get(key);
+      const usedBytes = Number(sub.traffic_used_bytes || 0);
+      const limitBytes = Number(sub.traffic_limit_bytes || 0);
+      const isExhaustedLocked =
+        sub.is_traffic_limited && (limitBytes <= 1000 || usedBytes >= limitBytes);
+      const recordedLockedAtBytes =
+        typeof lockedOrphansMap[key] === 'number' ? Number(lockedOrphansMap[key]) : null;
+      const isPreviouslyPasswordLockedAndIdle =
+        recordedLockedAtBytes !== null && usedBytes <= recordedLockedAtBytes + 10000;
 
       if (!isRegisteredActive && !pausedDashboardUser) {
-        // Ignore already-locked sub-users (<= 0.01 MB limit) with 0 risk
-        const isEffectivelyLocked = sub.is_traffic_limited && sub.traffic_limit_bytes <= 1000;
-        if (!isEffectivelyLocked) {
+        // Ignore exhausted or previously password-rotated/locked orphans unless new traffic appears
+        if (!isExhaustedLocked && !isPreviouslyPasswordLockedAndIdle) {
           const remainingMb = sub.is_traffic_limited
             ? Math.max(0, Number((sub.traffic_limit_mb - sub.traffic_used_mb).toFixed(2)))
             : 9999;
@@ -1906,8 +2043,8 @@ async function computeUnregisteredLeakAlert(subUsersMap) {
           });
         }
       } else if (!isRegisteredActive && pausedDashboardUser) {
-        // Paused in dashboard but still has open quota (> 1 KB) on gateway
-        if (!sub.is_traffic_limited || sub.traffic_limit_bytes > 1000) {
+        // Paused in dashboard but still has open quota and was not already locked/exhausted
+        if (!isExhaustedLocked && !isPreviouslyPasswordLockedAndIdle) {
           pausedOpenSubUsers.push({
             username: pausedDashboardUser,
             proxy_username: sub.proxy_username,
@@ -1918,7 +2055,8 @@ async function computeUnregisteredLeakAlert(subUsersMap) {
       }
     }
 
-    // 2. Check today's traffic on the default master account (cached 60s)
+    // 2. Check today's traffic on the default master account (cached 60s), subtracting post-cleanup baseline
+    let defaultUserRawTodayBytes = 0;
     let defaultUserTodayMb = 0;
     let defaultUserGrowing = false;
     let defaultTopDomains = [];
@@ -1929,20 +2067,24 @@ async function computeUnregisteredLeakAlert(subUsersMap) {
         defaultUserLeakCache.username === defaultUser.proxy_username &&
         nowMs - defaultUserLeakCache.ts < 60000
       ) {
-        defaultUserTodayMb = defaultUserLeakCache.todayMb;
-        defaultTopDomains = defaultUserLeakCache.topDomains;
+        defaultUserRawTodayBytes = Number(defaultUserLeakCache.todayBytes || 0);
+        const netBytes = Math.max(0, defaultUserRawTodayBytes - baselineBytesToday);
+        defaultUserTodayMb = Number((netBytes / 1000000).toFixed(2));
+        defaultTopDomains = netBytes >= 50000 ? defaultUserLeakCache.topDomains : [];
         defaultUserGrowing =
+          netBytes >= 50000 &&
           defaultUserLeakCache.prevTodayBytes !== null &&
-          defaultUserLeakCache.todayBytes > defaultUserLeakCache.prevTodayBytes + 10000;
+          defaultUserRawTodayBytes > defaultUserLeakCache.prevTodayBytes + 10000;
       } else {
-        const todayStr = formatNodeMavenDate(new Date());
         const rows = await fetchSubUserDomainStatsFromNodeMaven(
           defaultUser.proxy_username,
           todayStr,
           todayStr
         );
         const totalBytes = rows.reduce((sum, r) => sum + Number(r.bytes || 0), 0);
-        const totalMb = Number((totalBytes / 1000000).toFixed(2));
+        defaultUserRawTodayBytes = totalBytes;
+        const netBytes = Math.max(0, totalBytes - baselineBytesToday);
+        const netMb = Number((netBytes / 1000000).toFixed(2));
         const top = rows
           .filter((r) => Number(r.bytes || 0) >= 50000)
           .sort((a, b) => b.bytes - a.bytes)
@@ -1957,14 +2099,15 @@ async function computeUnregisteredLeakAlert(subUsersMap) {
           defaultUserLeakCache.username === defaultUser.proxy_username
             ? defaultUserLeakCache.todayBytes
             : null;
-        defaultUserGrowing = prevBytes !== null && totalBytes > prevBytes + 10000;
-        defaultUserTodayMb = totalMb;
-        defaultTopDomains = top;
+        defaultUserGrowing =
+          netBytes >= 50000 && prevBytes !== null && totalBytes > prevBytes + 10000;
+        defaultUserTodayMb = netMb;
+        defaultTopDomains = netBytes >= 50000 ? top : [];
 
         defaultUserLeakCache = {
           ts: nowMs,
           username: defaultUser.proxy_username,
-          todayMb: totalMb,
+          todayMb: Number((totalBytes / 1000000).toFixed(2)),
           todayBytes: totalBytes,
           prevTodayBytes: prevBytes,
           topDomains: top,
@@ -1995,6 +2138,7 @@ async function computeUnregisteredLeakAlert(subUsersMap) {
       severity,
       default_user_username: defaultUser?.proxy_username || '',
       default_user_today_mb: defaultUserTodayMb,
+      default_user_raw_today_bytes: defaultUserRawTodayBytes,
       default_user_unlimited: Boolean(defaultUser && !defaultUser.is_traffic_limited),
       default_user_growing: defaultUserGrowing,
       default_user_top_domains: defaultTopDomains,
@@ -3049,6 +3193,149 @@ async function handleNodeMavenCreateSubUser(req, res) {
 app.post('/nodemaven/create-subuser', handleNodeMavenCreateSubUser);
 app.post('/api/nodemaven/create-subuser', handleNodeMavenCreateSubUser);
 
+// Shared NodeMaven API v2 helper: parse response & verify actual provider success
+async function callNodeMavenSubUserApi(cleanKey, url, method, bodyObj = null) {
+  const headers = {
+    Authorization: `x-api-key ${cleanKey}`,
+    Accept: 'application/json',
+  };
+  const init = { method, headers };
+  if (bodyObj !== null) {
+    headers['Content-Type'] = 'application/json';
+    init.body = JSON.stringify(bodyObj);
+  }
+  try {
+    const res = await fetch(url, init);
+    const rawText = await res.text().catch(() => '');
+    let parsed = null;
+    try {
+      parsed = rawText ? JSON.parse(rawText) : null;
+    } catch {
+      parsed = null;
+    }
+    const providerOk = res.ok && (!parsed || parsed.success !== false);
+    const errMsg =
+      parsed?.description ||
+      parsed?.detail ||
+      parsed?.message ||
+      parsed?.error ||
+      (rawText && rawText.length < 180 ? rawText : `HTTP ${res.status}`);
+    return { ok: providerOk, status: res.status, data: parsed, error: providerOk ? '' : errMsg };
+  } catch (err) {
+    return { ok: false, status: 0, data: null, error: String(err?.message || 'network_error') };
+  }
+}
+
+// Try all NodeMaven API v2 DELETE endpoint variants (collection body, path without/with slash, query id)
+async function tryDeleteNodeMavenSubUser(cleanKey, sub) {
+  const encodedId = encodeURIComponent(sub.id);
+  const attempts = [
+    {
+      url: 'https://api.nodemaven.com/api/v2/base/sub-users/',
+      body: { id: sub.id },
+    },
+    {
+      url: `https://api.nodemaven.com/api/v2/base/sub-users/${encodedId}`,
+      body: null,
+    },
+    {
+      url: `https://api.nodemaven.com/api/v2/base/sub-users/${encodedId}/`,
+      body: null,
+    },
+    {
+      url: `https://api.nodemaven.com/api/v2/base/sub-users/?id=${encodedId}`,
+      body: null,
+    },
+  ];
+
+  let lastErr = '';
+  for (const attempt of attempts) {
+    const res = await callNodeMavenSubUserApi(cleanKey, attempt.url, 'DELETE', attempt.body);
+    if (res.ok) {
+      return { ok: true, error: '' };
+    }
+    lastErr = `[${res.status}] ${res.error}`;
+  }
+  console.warn(`[NODEMAVEN-DELETE] All DELETE variants failed for ${sub.proxy_username}: ${lastErr}`);
+  return { ok: false, error: lastErr };
+}
+
+// Lock a NodeMaven sub-user via PUT: rotate password + exhaust/minimize traffic_limit (passing >= 1MB validation)
+async function tryLockNodeMavenSubUser(cleanKey, sub, { rotatePassword = true } = {}) {
+  const randomLockPass = `${crypto.randomUUID().replace(/-/g, '').slice(0, 14).toLowerCase()}9`;
+  const targetPassword = rotatePassword ? randomLockPass : sub.proxy_password || randomLockPass;
+  const usedBytes = Math.max(0, Math.ceil(Number(sub.traffic_used_bytes || 0)));
+  // NodeMaven enforces minimum 1 MB (1,000,000 bytes) on traffic_limit; match usedBytes if higher
+  const exhaustedCapBytes = Math.max(1000000, usedBytes);
+
+  const payloads = [
+    // Attempt 1: Exhaust quota completely (used_traffic == traffic_limit >= 1MB) + lock password
+    {
+      mode: 'exhausted_and_rotated',
+      body: {
+        id: sub.id,
+        proxy_username: sub.proxy_username,
+        proxy_password: targetPassword,
+        is_traffic_limited: true,
+        used_traffic: exhaustedCapBytes,
+        traffic_limit: exhaustedCapBytes,
+      },
+    },
+    // Attempt 2: Minimize limit to max(1MB, usedBytes) + lock password (without touching used_traffic)
+    {
+      mode: 'limited_and_rotated',
+      body: {
+        id: sub.id,
+        proxy_username: sub.proxy_username,
+        proxy_password: targetPassword,
+        is_traffic_limited: true,
+        traffic_limit: exhaustedCapBytes,
+      },
+    },
+    // Attempt 3: Zero traffic_limit + lock password (in case account allows 0)
+    {
+      mode: 'zero_limit_and_rotated',
+      body: {
+        id: sub.id,
+        proxy_username: sub.proxy_username,
+        proxy_password: targetPassword,
+        is_traffic_limited: true,
+        traffic_limit: 0,
+      },
+    },
+    // Attempt 4: Rotate password only (immediately disconnects all devices using old credentials)
+    {
+      mode: 'password_rotated',
+      body: {
+        id: sub.id,
+        proxy_username: sub.proxy_username,
+        proxy_password: targetPassword,
+      },
+    },
+  ];
+
+  let lastErr = '';
+  for (const item of payloads) {
+    const res = await callNodeMavenSubUserApi(
+      cleanKey,
+      'https://api.nodemaven.com/api/v2/base/sub-users/',
+      'PUT',
+      item.body
+    );
+    if (res.ok) {
+      return {
+        ok: true,
+        mode: item.mode,
+        appliedLimitBytes: item.body.traffic_limit ?? sub.traffic_limit_bytes,
+        error: '',
+      };
+    }
+    lastErr = `[${res.status}] ${res.error}`;
+  }
+  console.error(`[NODEMAVEN-LOCK] All PUT lock variants failed for ${sub.proxy_username}: ${lastErr}`);
+  return { ok: false, mode: 'failed', appliedLimitBytes: null, error: lastErr };
+}
+
 // POST /api/nodemaven/delete-subuser
 // Deletes (or immediately locks + rotates password of) a NodeMaven sub-user when removed from the dashboard
 async function handleNodeMavenDeleteSubUser(req, res) {
@@ -3073,43 +3360,27 @@ async function handleNodeMavenDeleteSubUser(req, res) {
       return res.json({ success: true, skipped: true });
     }
 
-    // Attempt DELETE first; fallback to locking traffic_limit=1 & rotating password
-    const delRes = await fetch(
-      `https://api.nodemaven.com/api/v2/base/sub-users/${encodeURIComponent(nmSubUser.id)}/`,
-      {
-        method: 'DELETE',
-        headers: {
-          Authorization: `x-api-key ${cleanKey}`,
-          Accept: 'application/json',
-        },
-      }
-    );
-
-    if (delRes.ok) {
+    const delAttempt = await tryDeleteNodeMavenSubUser(cleanKey, nmSubUser);
+    if (delAttempt.ok) {
       return res.json({ success: true, deleted: true, sub_user: nmSubUser.proxy_username });
     }
 
-    const rotatedPassword = `${crypto.randomUUID().replace(/-/g, '').slice(0, 14).toLowerCase()}9`;
-    const lockRes = await fetch('https://api.nodemaven.com/api/v2/base/sub-users/', {
-      method: 'PUT',
-      headers: {
-        Authorization: `x-api-key ${cleanKey}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({
-        id: nmSubUser.id,
-        proxy_username: nmSubUser.proxy_username,
-        proxy_password: rotatedPassword,
-        is_traffic_limited: true,
-        traffic_limit: 1,
-      }),
-    });
+    const lockAttempt = await tryLockNodeMavenSubUser(cleanKey, nmSubUser, { rotatePassword: true });
+    if (lockAttempt.ok) {
+      const vaultMeta = await getStoredAdminVault();
+      const lockedMap = { ...(vaultMeta?.locked_orphans || {}) };
+      lockedMap[String(nmSubUser.proxy_username).toLowerCase()] = Number(
+        nmSubUser.traffic_used_bytes || 0
+      );
+      await saveStoredAdminVault({ locked_orphans: lockedMap });
+    }
 
     return res.json({
-      success: lockRes.ok,
+      success: lockAttempt.ok,
       deleted: false,
-      locked: lockRes.ok,
+      locked: lockAttempt.ok,
+      lock_mode: lockAttempt.mode,
+      error: lockAttempt.ok ? undefined : lockAttempt.error,
       sub_user: nmSubUser.proxy_username,
     });
   } catch (err) {
@@ -3122,7 +3393,7 @@ app.post('/nodemaven/delete-subuser', handleNodeMavenDeleteSubUser);
 app.post('/api/nodemaven/delete-subuser', handleNodeMavenDeleteSubUser);
 
 // POST /api/nodemaven/toggle-subuser
-// Suspends (locks quota to 1 byte) or restores quota for a sub-user when toggled inactive/active
+// Suspends (locks & rotates password) or restores original password + quota when toggled inactive/active
 async function handleNodeMavenToggleSubUser(req, res) {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   const cleanKey = getNodeMavenApiKey();
@@ -3131,7 +3402,12 @@ async function handleNodeMavenToggleSubUser(req, res) {
   }
 
   try {
-    const { proxy_username = '', is_active = true, quota_mb = 50 } = req.body || {};
+    const {
+      proxy_username = '',
+      proxy_password = '',
+      is_active = true,
+      quota_mb = 50,
+    } = req.body || {};
     const rawUser = String(proxy_username || '').trim();
     const subPrefix = rawUser.includes('-country-')
       ? rawUser.split('-country-')[0].trim()
@@ -3146,31 +3422,73 @@ async function handleNodeMavenToggleSubUser(req, res) {
       return res.json({ success: true, skipped: true });
     }
 
-    const targetLimitBytes = is_active
-      ? Math.round((Number(quota_mb) > 0 ? Number(quota_mb) : 50) * 1000000)
-      : 1;
+    const key = String(nmSubUser.proxy_username).toLowerCase();
 
-    const putRes = await fetch('https://api.nodemaven.com/api/v2/base/sub-users/', {
-      method: 'PUT',
-      headers: {
-        Authorization: `x-api-key ${cleanKey}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({
+    if (!is_active) {
+      const lockAttempt = await tryLockNodeMavenSubUser(cleanKey, nmSubUser, {
+        rotatePassword: true,
+      });
+      if (lockAttempt.ok) {
+        const vaultMeta = await getStoredAdminVault();
+        const lockedMap = { ...(vaultMeta?.locked_orphans || {}) };
+        lockedMap[key] = Number(nmSubUser.traffic_used_bytes || 0);
+        await saveStoredAdminVault({ locked_orphans: lockedMap });
+      }
+      return res.json({
+        success: lockAttempt.ok,
+        sub_user: nmSubUser.proxy_username,
+        is_active: false,
+        lock_mode: lockAttempt.mode,
+        traffic_limit_bytes: lockAttempt.appliedLimitBytes,
+        error: lockAttempt.ok ? undefined : lockAttempt.error,
+      });
+    }
+
+    // Re-activating: restore client's saved password from request or Supabase + requested quota
+    let restorePassword = String(proxy_password || '').trim();
+    if (!restorePassword) {
+      const { data: rows } = await supabase.from('proxy_clients').select('proxy_host');
+      for (const r of rows || []) {
+        const parsed = parseStoredProxyHost(r.proxy_host);
+        if (String(parsed.subUserPrefix || '').toLowerCase() === key && parsed.pPass) {
+          restorePassword = String(parsed.pPass).trim();
+          break;
+        }
+      }
+    }
+    const targetLimitBytes = Math.max(
+      1000000,
+      Math.round((Number(quota_mb) > 0 ? Number(quota_mb) : 50) * 1000000)
+    );
+
+    const putRes = await callNodeMavenSubUserApi(
+      cleanKey,
+      'https://api.nodemaven.com/api/v2/base/sub-users/',
+      'PUT',
+      {
         id: nmSubUser.id,
         proxy_username: nmSubUser.proxy_username,
-        proxy_password: nmSubUser.proxy_password,
+        proxy_password: restorePassword || nmSubUser.proxy_password,
         is_traffic_limited: true,
         traffic_limit: targetLimitBytes,
-      }),
-    });
+      }
+    );
+
+    if (putRes.ok) {
+      const vaultMeta = await getStoredAdminVault();
+      if (vaultMeta?.locked_orphans && key in vaultMeta.locked_orphans) {
+        const lockedMap = { ...vaultMeta.locked_orphans };
+        delete lockedMap[key];
+        await saveStoredAdminVault({ locked_orphans: lockedMap });
+      }
+    }
 
     return res.json({
       success: putRes.ok,
       sub_user: nmSubUser.proxy_username,
-      is_active: Boolean(is_active),
+      is_active: true,
       traffic_limit_bytes: targetLimitBytes,
+      error: putRes.ok ? undefined : putRes.error,
     });
   } catch (err) {
     console.error('[NODEMAVEN-TOGGLE] Error:', err);
@@ -3183,7 +3501,7 @@ app.post('/api/nodemaven/toggle-subuser', handleNodeMavenToggleSubUser);
 
 // POST /api/nodemaven/cleanup-orphans
 // Removes/locks orphan sub-users not in Supabase, locks paused subscribers' sub-users,
-// and optionally rotates the default master account password to halt unregistered leaks.
+// rotates the default master account password, and records today's baseline so the alert clears immediately.
 async function handleNodeMavenCleanupOrphans(req, res) {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   const cleanKey = getNodeMavenApiKey();
@@ -3198,84 +3516,122 @@ async function handleNodeMavenCleanupOrphans(req, res) {
       return res.status(502).json({ success: false, error: 'تعذر الاتصال بخادم البروكسي' });
     }
 
-    const leakAlert = await computeUnregisteredLeakAlert(nmMap);
+    const leakAlertBefore = await computeUnregisteredLeakAlert(nmMap);
+    const vaultMeta = await getStoredAdminVault();
+    const nextLockedOrphans = { ...(vaultMeta?.locked_orphans || {}) };
+
     const cleanedOrphans = [];
     const lockedPaused = [];
+    const failedItems = [];
     let defaultRotated = false;
+    let defaultRotateError = '';
 
-    const lockOrDelete = async (sub, tryDelete) => {
-      if (tryDelete) {
-        const delRes = await fetch(
-          `https://api.nodemaven.com/api/v2/base/sub-users/${encodeURIComponent(sub.id)}/`,
-          {
-            method: 'DELETE',
-            headers: { Authorization: `x-api-key ${cleanKey}`, Accept: 'application/json' },
-          }
-        );
-        if (delRes.ok) return 'deleted';
-      }
-      const newPass = `${crypto.randomUUID().replace(/-/g, '').slice(0, 14).toLowerCase()}9`;
-      const putRes = await fetch('https://api.nodemaven.com/api/v2/base/sub-users/', {
-        method: 'PUT',
-        headers: {
-          Authorization: `x-api-key ${cleanKey}`,
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        },
-        body: JSON.stringify({
-          id: sub.id,
-          proxy_username: sub.proxy_username,
-          proxy_password: newPass,
-          is_traffic_limited: true,
-          traffic_limit: 1,
-        }),
-      });
-      return putRes.ok ? 'locked' : 'failed';
-    };
-
-    for (const orphan of leakAlert.orphan_sub_users || []) {
-      const sub = nmMap[String(orphan.proxy_username).toLowerCase()];
+    for (const orphan of leakAlertBefore.orphan_sub_users || []) {
+      const key = String(orphan.proxy_username).toLowerCase();
+      const sub = nmMap[key];
       if (!sub || sub.is_default_user) continue;
-      const action = await lockOrDelete(sub, true);
-      cleanedOrphans.push({ proxy_username: sub.proxy_username, action });
+
+      const delRes = await tryDeleteNodeMavenSubUser(cleanKey, sub);
+      if (delRes.ok) {
+        delete nextLockedOrphans[key];
+        cleanedOrphans.push({ proxy_username: sub.proxy_username, action: 'deleted' });
+        continue;
+      }
+
+      const lockRes = await tryLockNodeMavenSubUser(cleanKey, sub, { rotatePassword: true });
+      if (lockRes.ok) {
+        nextLockedOrphans[key] = Number(sub.traffic_used_bytes || 0);
+        cleanedOrphans.push({
+          proxy_username: sub.proxy_username,
+          action: 'locked',
+          mode: lockRes.mode,
+        });
+      } else {
+        failedItems.push({
+          proxy_username: sub.proxy_username,
+          type: 'orphan',
+          error: lockRes.error || delRes.error || 'فشل الحذف والتجميد',
+        });
+      }
     }
 
-    for (const paused of leakAlert.paused_open_sub_users || []) {
-      const sub = nmMap[String(paused.proxy_username).toLowerCase()];
+    for (const paused of leakAlertBefore.paused_open_sub_users || []) {
+      const key = String(paused.proxy_username).toLowerCase();
+      const sub = nmMap[key];
       if (!sub || sub.is_default_user) continue;
-      const action = await lockOrDelete(sub, false);
-      lockedPaused.push({ proxy_username: sub.proxy_username, action });
+
+      const lockRes = await tryLockNodeMavenSubUser(cleanKey, sub, { rotatePassword: true });
+      if (lockRes.ok) {
+        nextLockedOrphans[key] = Number(sub.traffic_used_bytes || 0);
+        lockedPaused.push({
+          proxy_username: sub.proxy_username,
+          action: 'locked',
+          mode: lockRes.mode,
+        });
+      } else {
+        failedItems.push({
+          proxy_username: sub.proxy_username,
+          type: 'paused',
+          error: lockRes.error || 'فشل تجميد الحساب الموقوف',
+        });
+      }
     }
 
     if (rotateDefault) {
       const defSub = Object.values(nmMap).find((u) => u.is_default_user);
       if (defSub?.id) {
         const newMasterPass = `${crypto.randomUUID().replace(/-/g, '').slice(0, 16).toLowerCase()}a`;
-        const putRes = await fetch('https://api.nodemaven.com/api/v2/base/sub-users/', {
-          method: 'PUT',
-          headers: {
-            Authorization: `x-api-key ${cleanKey}`,
-            'Content-Type': 'application/json',
-            Accept: 'application/json',
-          },
-          body: JSON.stringify({
+        const putRes = await callNodeMavenSubUserApi(
+          cleanKey,
+          'https://api.nodemaven.com/api/v2/base/sub-users/',
+          'PUT',
+          {
             id: defSub.id,
             proxy_username: defSub.proxy_username,
             proxy_password: newMasterPass,
-          }),
-        });
+          }
+        );
         defaultRotated = putRes.ok;
+        if (!putRes.ok) {
+          defaultRotateError = putRes.error;
+        }
       }
     }
 
-    // Invalidate cache so next usage poll reflects clean state
+    // Record today's default-user baseline bytes & locked orphans so historical leak alert clears immediately
+    const todayStr = formatNodeMavenDate(new Date());
+    const currentDefaultBytes = Number(
+      leakAlertBefore.default_user_raw_today_bytes || defaultUserLeakCache.todayBytes || 0
+    );
+    await saveStoredAdminVault({
+      locked_orphans: nextLockedOrphans,
+      leak_baseline_date: todayStr,
+      leak_baseline_default_bytes: currentDefaultBytes,
+    });
+
+    // Invalidate cache & compute fresh post-cleanup alert immediately
     defaultUserLeakCache.ts = 0;
+    const freshMap = await fetchNodeMavenSubUsersMap();
+    const freshLeakAlert = await computeUnregisteredLeakAlert(freshMap || nmMap);
+
+    const deletedCount = cleanedOrphans.filter((i) => i.action === 'deleted').length;
+    const lockedCount =
+      cleanedOrphans.filter((i) => i.action === 'locked').length +
+      lockedPaused.filter((i) => i.action === 'locked').length;
+    const failedCount = failedItems.length;
 
     return res.json({
-      success: true,
+      success: failedCount === 0,
+      partial: failedCount > 0 && (deletedCount > 0 || lockedCount > 0 || defaultRotated),
+      deleted_count: deletedCount,
+      locked_count: lockedCount,
+      failed_count: failedCount,
       cleaned_orphans: cleanedOrphans,
       locked_paused: lockedPaused,
+      failed_items: failedItems,
       default_rotated: defaultRotated,
+      default_rotate_error: defaultRotateError || undefined,
+      leak_alert: freshLeakAlert,
     });
   } catch (err) {
     console.error('[NODEMAVEN-CLEANUP] Error:', err);
